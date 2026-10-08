@@ -1,0 +1,258 @@
+[tools]
+go = "1.27.1"
+
+[tasks."go-version"]
+description = "Print the pinned Go version"
+run = "go version"
+
+[tasks."version-test"]
+description = "Verify automatic 0.1.x version calculation"
+run = "sh scripts/version_test.sh"
+
+[tasks.version]
+description = "Print the automatically managed Plateau version"
+run = "sh scripts/version.sh"
+
+[tasks."release-notes-test"]
+description = "한국어 릴리스 설명과 버전별 변경 범위 검사"
+run = "sh scripts/release_notes_test.sh"
+
+[tasks."release-notes"]
+description = "버전, 대상 커밋, 패키지 경로로 한국어 릴리스 설명 출력"
+run = "sh scripts/release_notes.sh"
+
+[tasks."package-test"]
+description = "Build and inspect the macOS installer package"
+run = '''
+set -eu
+plateau_version="${PLATEAU_VERSION:-$(sh scripts/version.sh)}"
+PLATEAU_VERSION="$plateau_version" mise run package
+package_path="dist/plateau-${plateau_version}-macos-universal.pkg"
+checksum_path="${package_path}.sha256"
+test -f "$package_path"
+test -f "$checksum_path"
+/usr/sbin/pkgutil --payload-files "$package_path" | grep -qx './usr/local/bin/plateau'
+
+plateau_package_test_workspace="$(mktemp -d)"
+trap 'rm -rf "$plateau_package_test_workspace"' EXIT
+/usr/sbin/pkgutil --expand-full "$package_path" "$plateau_package_test_workspace/package"
+test "$(/usr/bin/xmllint --xpath 'string(/pkg-info/@identifier)' "$plateau_package_test_workspace/package/PackageInfo")" = 'com.creatrip.plateau.cli'
+test "$(/usr/bin/xmllint --xpath 'string(/pkg-info/@version)' "$plateau_package_test_workspace/package/PackageInfo")" = "$plateau_version"
+for plateau_notice_file in LICENSE NOTICE THIRD_PARTY_NOTICES.txt; do
+  cmp "$plateau_notice_file" "$plateau_package_test_workspace/package/Payload/usr/local/share/plateau/$plateau_notice_file"
+done
+
+(cd dist && /usr/bin/shasum -a 256 -c "$(basename "$checksum_path")")
+test "$(bin/plateau-darwin-universal version)" = "plateau ${plateau_version}"
+/usr/bin/lipo bin/plateau-darwin-universal -verify_arch arm64
+/usr/bin/lipo bin/plateau-darwin-universal -verify_arch x86_64
+
+plateau_install_test_dir="$plateau_package_test_workspace/install"
+mkdir -p "$plateau_install_test_dir"
+cp bin/plateau-darwin-universal "$plateau_install_test_dir/plateau"
+PLATEAU_VERSION="$plateau_version" PLATEAU_INSTALL_DIR="$plateau_install_test_dir" mise run install
+test "$("$plateau_install_test_dir/plateau" version)" = "plateau ${plateau_version}"
+cp "$plateau_install_test_dir/plateau" "$plateau_install_test_dir/before-failed-build"
+if GOOS=plateau-invalid PLATEAU_INSTALL_DIR="$plateau_install_test_dir" mise run install >"$plateau_install_test_dir/failure.log" 2>&1; then
+  printf 'Invalid build unexpectedly succeeded\n' >&2
+  exit 1
+fi
+cmp "$plateau_install_test_dir/plateau" "$plateau_install_test_dir/before-failed-build"
+for plateau_install_leftover in "$plateau_install_test_dir"/.plateau-install.*; do
+  test ! -e "$plateau_install_leftover"
+done
+'''
+
+[tasks.package]
+description = "Build a Universal macOS installer package"
+run = '''
+set -eu
+plateau_version="${PLATEAU_VERSION:-$(sh scripts/version.sh)}"
+case "$plateau_version" in
+  0.1.*) ;;
+  *) printf 'Package version must be 0.1.x, got %s\n' "$plateau_version" >&2; exit 1 ;;
+esac
+plateau_patch="${plateau_version#0.1.}"
+case "$plateau_patch" in
+  ''|*[!0-9]*) printf 'Package patch version must be numeric, got %s\n' "$plateau_version" >&2; exit 1 ;;
+esac
+
+mkdir -p bin dist
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w -X main.version=$plateau_version" -o bin/plateau-darwin-arm64 ./cmd/plateau
+CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=$plateau_version" -o bin/plateau-darwin-amd64 ./cmd/plateau
+/usr/bin/lipo -create bin/plateau-darwin-arm64 bin/plateau-darwin-amd64 -output bin/plateau-darwin-universal
+/bin/chmod 0755 bin/plateau-darwin-universal
+/usr/bin/lipo bin/plateau-darwin-universal -verify_arch arm64
+/usr/bin/lipo bin/plateau-darwin-universal -verify_arch x86_64
+test "$(bin/plateau-darwin-universal version)" = "plateau ${plateau_version}"
+
+package_root="$(mktemp -d)"
+trap 'rm -rf "$package_root"' EXIT
+/usr/bin/install -d -m 0755 "$package_root/usr/local/bin"
+/usr/bin/install -m 0755 bin/plateau-darwin-universal "$package_root/usr/local/bin/plateau"
+/usr/bin/install -d -m 0755 "$package_root/usr/local/share/plateau"
+for plateau_notice_file in LICENSE NOTICE THIRD_PARTY_NOTICES.txt; do
+  /usr/bin/install -m 0644 "$plateau_notice_file" "$package_root/usr/local/share/plateau/$plateau_notice_file"
+done
+package_path="dist/plateau-${plateau_version}-macos-universal.pkg"
+checksum_path="${package_path}.sha256"
+rm -f "$package_path" "$checksum_path"
+if [ -n "${PLATEAU_INSTALLER_IDENTITY:-}" ]; then
+  /usr/bin/pkgbuild --root "$package_root" --identifier com.creatrip.plateau.cli --version "$plateau_version" --install-location / --sign "$PLATEAU_INSTALLER_IDENTITY" "$package_path"
+else
+  /usr/bin/pkgbuild --root "$package_root" --identifier com.creatrip.plateau.cli --version "$plateau_version" --install-location / "$package_path"
+fi
+(cd dist && /usr/bin/shasum -a 256 "$(basename "$package_path")" >"$(basename "$checksum_path")")
+printf 'Built %s\n' "$package_path"
+'''
+
+[tasks.release]
+description = "Publish the current main commit as the next 0.1.x GitHub release"
+run = '''
+set -eu
+current_branch="$(git branch --show-current)"
+if [ "$current_branch" != "main" ]; then
+  printf 'Releases must be created from main, got %s\n' "$current_branch" >&2
+  exit 1
+fi
+if [ -n "$(git status --porcelain)" ]; then
+  printf 'Commit or discard all changes before releasing\n' >&2
+  exit 1
+fi
+git fetch origin main --tags
+head_commit="$(git rev-parse HEAD)"
+remote_commit="$(git rev-parse origin/main)"
+if [ "$head_commit" != "$remote_commit" ]; then
+  printf 'Push the current main commit before releasing\n' >&2
+  exit 1
+fi
+if ! command -v gh >/dev/null 2>&1; then
+  printf 'GitHub CLI is required to publish a release\n' >&2
+  exit 1
+fi
+if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+  printf 'GitHub CLI is not authenticated for github.com\n' >&2
+  exit 1
+fi
+
+plateau_version="$(sh scripts/version.sh)"
+release_tag="v${plateau_version}"
+if gh release view "$release_tag" >/dev/null 2>&1; then
+  printf 'Release %s already exists\n' "$release_tag"
+  exit 0
+fi
+PLATEAU_VERSION="$plateau_version" mise run check
+PLATEAU_VERSION="$plateau_version" mise run package-test
+package_path="dist/plateau-${plateau_version}-macos-universal.pkg"
+checksum_path="${package_path}.sha256"
+release_notes=$(mktemp)
+trap 'rm -f "$release_notes"' EXIT
+sh scripts/release_notes.sh "$plateau_version" "$head_commit" "$package_path" >"$release_notes"
+
+tag_commit="$(git rev-list -n 1 "$release_tag" 2>/dev/null || true)"
+if [ -n "$tag_commit" ] && [ "$tag_commit" != "$head_commit" ]; then
+  printf 'Tag %s already points to another commit\n' "$release_tag" >&2
+  exit 1
+fi
+if [ -z "$tag_commit" ]; then
+  git tag -a "$release_tag" -m "Plateau ${plateau_version}"
+fi
+git push origin "refs/tags/${release_tag}"
+
+gh release create "$release_tag" "$package_path" "$checksum_path" --verify-tag --title "$release_tag" --notes-file "$release_notes" --latest
+printf 'Released Plateau %s\n' "$plateau_version"
+'''
+
+[tasks."mod-download"]
+description = "Download Go module dependencies"
+run = "go mod download"
+
+[tasks."mod-get"]
+description = "Add or update a Go module; pass module@version after --"
+run = "go get"
+
+[tasks."mod-tidy"]
+description = "Synchronize go.mod and go.sum with the source tree"
+run = "go mod tidy"
+
+[tasks."mod-tidy-check"]
+description = "Verify go.mod and go.sum are tidy without modifying them"
+run = "go mod tidy -diff"
+
+[tasks."mod-verify"]
+description = "Verify downloaded Go modules have not been modified"
+run = "go mod verify"
+
+[tasks.dev]
+description = "Run the Plateau CLI"
+run = "go run ./cmd/plateau"
+
+[tasks.fmt]
+description = "Format Go source files"
+run = "gofmt -w ."
+
+[tasks."fmt-check"]
+description = "Verify Go source formatting"
+run = '''
+files="$(gofmt -l .)"
+if [ -n "$files" ]; then
+  printf '%s\n' "$files"
+  exit 1
+fi
+'''
+
+[tasks.lint]
+description = "Run Go static analysis"
+run = "go vet ./..."
+
+[tasks.test]
+description = "Run tests with the race detector"
+run = "go test -race ./..."
+
+[tasks.coverage]
+description = "Measure statement coverage and save the profile under bin"
+run = '''
+mkdir -p bin
+go test -race -coverprofile=bin/coverage.out ./...
+go tool cover -func=bin/coverage.out
+'''
+
+[tasks."test-package"]
+description = "Run selected Go test packages; pass package paths after --"
+run = "go test -race"
+
+[tasks.build]
+description = "Build the Plateau CLI"
+run = '''
+plateau_version="${PLATEAU_VERSION:-$(sh scripts/version.sh)}"
+if [ -z "${PLATEAU_VERSION:-}" ] && [ -n "$(git status --porcelain)" ]; then
+  plateau_version="${plateau_version}-dirty"
+fi
+go build -ldflags "-X main.version=$plateau_version" -o bin/plateau ./cmd/plateau
+'''
+
+[tasks.install]
+description = "Install Plateau into PLATEAU_INSTALL_DIR or ~/.local/bin"
+run = '''
+set -eu
+plateau_install_dir="${PLATEAU_INSTALL_DIR:-${HOME}/.local/bin}"
+plateau_version="${PLATEAU_VERSION:-$(sh scripts/version.sh)}"
+if [ -z "${PLATEAU_VERSION:-}" ] && [ -n "$(git status --porcelain)" ]; then
+  plateau_version="${plateau_version}-dirty"
+fi
+mkdir -p "$plateau_install_dir"
+plateau_install_workspace="$(mktemp -d "$plateau_install_dir/.plateau-install.XXXXXX")"
+trap 'rm -rf "$plateau_install_workspace"' EXIT
+if [ -d "$plateau_install_dir/plateau" ]; then
+  printf 'Install destination is a directory: %s/plateau\n' "$plateau_install_dir" >&2
+  exit 1
+fi
+go build -ldflags "-X main.version=$plateau_version" -o "$plateau_install_workspace/plateau" ./cmd/plateau
+chmod 0755 "$plateau_install_workspace/plateau"
+mv -f "$plateau_install_workspace/plateau" "$plateau_install_dir/plateau"
+printf 'Installed Plateau %s at %s/plateau\n' "$plateau_version" "$plateau_install_dir"
+'''
+
+[tasks.check]
+description = "Run every local quality gate"
+depends = ["version-test", "release-notes-test", "mod-tidy-check", "mod-verify", "fmt-check", "lint", "test", "build"]
